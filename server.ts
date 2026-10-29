@@ -272,14 +272,41 @@ app.post('/api/call-turn', async (req: Request, res: Response) => {
     }
 
     if (!userText) {
-      res.json({
-        userText: '',
-        replyText: '',
-        audioBase64: null,
-        ignored: true,
-        reason: 'No se detectó voz clara.',
-      });
-      return;
+      if (audioBase64) {
+        userText = '(Audio detectado pero tenue)';
+        // Provide friendly response
+        const fallbackReply = 'Te he escuchado un poco lejos. ¿Podrías repetirme lo que me decías?';
+        let fallbackAudio: string | null = null;
+        try {
+          const ttsResp = await ai.models.generateContent({
+            model: 'gemini-3.8-flash-lite-tts',
+            contents: [{ role: 'user', parts: [{ text: fallbackReply }] }],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+            },
+          });
+          fallbackAudio = ttsResp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
+        } catch (_) {}
+
+        res.json({
+          userText,
+          replyText: fallbackReply,
+          audioBase64: fallbackAudio,
+          voice,
+          latencyMs: Date.now() - startTime,
+        });
+        return;
+      } else {
+        res.json({
+          userText: '',
+          replyText: '',
+          audioBase64: null,
+          ignored: true,
+          reason: 'No se recibió texto ni audio.',
+        });
+        return;
+      }
     }
 
     // Step 2: Build conversation history

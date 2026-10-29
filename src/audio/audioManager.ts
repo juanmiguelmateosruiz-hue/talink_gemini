@@ -1,6 +1,6 @@
 /**
  * Audio Manager: Web Audio synthesis, visualizer analyser, audio playback,
- * silence detection (VAD), and speech recognition helpers.
+ * adaptive silence detection (VAD), iOS/Android audio unlocking, and speech helpers.
  */
 
 class AudioManager {
@@ -11,17 +11,18 @@ class AudioManager {
   private mediaRecorder: MediaRecorder | null = null;
   private recordedChunks: Blob[] = [];
 
-  // Playback state
-  private currentAudioElement: HTMLAudioElement | null = null;
-  private currentSourceNode: AudioBufferSourceNode | null = null;
+  // Playback state & mobile audio unlocking
+  private unlockedAudioElement: HTMLAudioElement | null = null;
   private isPlaying = false;
+  private isAudioUnlocked = false;
 
-  // Silence detection
+  // Adaptive Silence Detection (VAD)
   private vadInterval: number | null = null;
   private speechDetected = false;
   private silenceStartTime: number | null = null;
-  private silenceThreshold = 0.025; // RMS threshold
-  private silenceDurationMs = 1200; // Time in silence before triggering turn
+  private silenceThreshold = 0.008; // Sensitive threshold for mobile and desktop mics
+  private silenceDurationMs = 900; // Fast 900ms pause for natural conversational flow
+  private noiseFloor = 0.003;
 
   public onSilenceDetected?: () => void;
   public onVolumeUpdate?: (volume: number) => void;
@@ -33,9 +34,44 @@ class AudioManager {
       this.audioCtx = new AudioContextClass();
     }
     if (this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume();
+      this.audioCtx.resume().catch(() => {});
     }
     return this.audioCtx;
+  }
+
+  /**
+   * Crucial for iOS Safari & Android: Unlocks the audio pipeline on direct user touch/click.
+   */
+  public primeAudioPlayback() {
+    try {
+      const ctx = this.getAudioContext();
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      // Play a short silent buffer to unlock Web Audio on iOS
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+
+      // Create and prime a reusable HTMLAudioElement with a silent data URI
+      if (!this.unlockedAudioElement) {
+        this.unlockedAudioElement = new Audio();
+        // 1-sample silent wav data URI
+        this.unlockedAudioElement.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+        this.unlockedAudioElement.load();
+        this.unlockedAudioElement.play().then(() => {
+          this.unlockedAudioElement?.pause();
+          this.isAudioUnlocked = true;
+        }).catch(() => {
+          // Normal if browser requires another touch
+        });
+      }
+    } catch (e) {
+      console.warn('Audio unlock prime:', e);
+    }
   }
 
   // --- Sound Effects ---
@@ -49,16 +85,16 @@ class AudioManager {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, now + i * 0.08);
+        osc.frequency.setValueAtTime(freq, now + i * 0.07);
 
-        gain.gain.setValueAtTime(0, now + i * 0.08);
-        gain.gain.linearRampToValueAtTime(0.15, now + i * 0.08 + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.08 + 0.35);
+        gain.gain.setValueAtTime(0, now + i * 0.07);
+        gain.gain.linearRampToValueAtTime(0.14, now + i * 0.07 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.07 + 0.3);
 
         osc.connect(gain);
         gain.connect(ctx.destination);
-        osc.start(now + i * 0.08);
-        osc.stop(now + i * 0.08 + 0.36);
+        osc.start(now + i * 0.07);
+        osc.stop(now + i * 0.07 + 0.32);
       });
     } catch (e) {
       console.warn('Audio chime error:', e);
@@ -74,15 +110,15 @@ class AudioManager {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, now + i * 0.14);
+        osc.frequency.setValueAtTime(freq, now + i * 0.12);
 
-        gain.gain.setValueAtTime(0.12, now + i * 0.14);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.14 + 0.2);
+        gain.gain.setValueAtTime(0.12, now + i * 0.12);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.12 + 0.18);
 
         osc.connect(gain);
         gain.connect(ctx.destination);
-        osc.start(now + i * 0.14);
-        osc.stop(now + i * 0.14 + 0.22);
+        osc.start(now + i * 0.12);
+        osc.stop(now + i * 0.12 + 0.2);
       });
     } catch (e) {
       console.warn('Audio hangup error:', e);
@@ -92,8 +128,15 @@ class AudioManager {
   // --- Microphone & Analyser ---
 
   public async startMicrophone(): Promise<MediaStream> {
-    if (this.micStream) {
+    if (this.micStream && this.micStream.active) {
       return this.micStream;
+    }
+
+    this.stopMicrophone();
+
+    // Check if mediaDevices is supported
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Tu navegador o dispositivo no soporta acceso al micrófono (mediaDevices no disponible).');
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -108,7 +151,7 @@ class AudioManager {
     const ctx = this.getAudioContext();
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 256;
-    this.analyser.smoothingTimeConstant = 0.8;
+    this.analyser.smoothingTimeConstant = 0.75;
 
     this.micSource = ctx.createMediaStreamSource(stream);
     this.micSource.connect(this.analyser);
@@ -120,7 +163,11 @@ class AudioManager {
   public stopMicrophone() {
     this.stopVAD();
     if (this.micStream) {
-      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch (_) {}
+      });
       this.micStream = null;
     }
     if (this.micSource) {
@@ -135,15 +182,19 @@ class AudioManager {
     return this.analyser;
   }
 
-  // --- Voice Activity Detection (VAD) ---
+  // --- Adaptive Voice Activity Detection (VAD) ---
+
+  public setSilenceDelay(ms: number) {
+    this.silenceDurationMs = Math.max(500, ms);
+  }
 
   private startVAD() {
     this.stopVAD();
     const dataArray = new Uint8Array(128);
+    let sampleCount = 0;
 
     this.vadInterval = window.setInterval(() => {
       if (!this.analyser || this.isPlaying) {
-        // Don't detect silence while Gemini is speaking
         return;
       }
 
@@ -157,6 +208,13 @@ class AudioManager {
       }
       const rms = Math.sqrt(sum / dataArray.length);
 
+      // Dynamic noise floor calibration in the first 1-2 seconds
+      sampleCount++;
+      if (sampleCount < 20) {
+        this.noiseFloor = (this.noiseFloor * 0.8) + (rms * 0.2);
+        this.silenceThreshold = Math.max(0.007, this.noiseFloor * 2.0);
+      }
+
       if (this.onVolumeUpdate) {
         this.onVolumeUpdate(rms);
       }
@@ -166,12 +224,11 @@ class AudioManager {
         this.speechDetected = true;
         this.silenceStartTime = null;
       } else if (this.speechDetected) {
-        // User was speaking, now dropped into silence
         const now = Date.now();
         if (this.silenceStartTime === null) {
           this.silenceStartTime = now;
         } else if (now - this.silenceStartTime >= this.silenceDurationMs) {
-          // Silence duration met
+          // Pause detected after speech
           this.speechDetected = false;
           this.silenceStartTime = null;
           if (this.onSilenceDetected) {
@@ -179,7 +236,7 @@ class AudioManager {
           }
         }
       }
-    }, 80);
+    }, 60);
   }
 
   private stopVAD() {
@@ -196,24 +253,60 @@ class AudioManager {
     this.silenceStartTime = null;
   }
 
-  // --- MediaRecorder for Audio Blob capture ---
+  public markSpeechDetectedManually() {
+    this.speechDetected = true;
+    this.silenceStartTime = null;
+  }
+
+  // --- Robust Cross-Platform MediaRecorder (iOS Safari, Android, Desktop) ---
+
+  private getBestMimeType(): string {
+    if (typeof MediaRecorder === 'undefined') return '';
+    const candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4',
+      'audio/aac',
+      'audio/ogg;codecs=opus',
+      '',
+    ];
+    for (const c of candidates) {
+      if (c === '' || MediaRecorder.isTypeSupported(c)) {
+        return c;
+      }
+    }
+    return '';
+  }
 
   public startRecording() {
     if (!this.micStream) return;
     this.recordedChunks = [];
     try {
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm';
-      this.mediaRecorder = new MediaRecorder(this.micStream, { mimeType });
+      const mimeType = this.getBestMimeType();
+      const options = mimeType ? { mimeType } : undefined;
+      this.mediaRecorder = new MediaRecorder(this.micStream, options);
+
       this.mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           this.recordedChunks.push(e.data);
         }
       };
-      this.mediaRecorder.start(250);
+
+      this.mediaRecorder.start(200);
     } catch (e) {
-      console.warn('MediaRecorder error:', e);
+      console.warn('MediaRecorder init fallback:', e);
+      try {
+        // Fallback without options for older iOS / Android webviews
+        this.mediaRecorder = new MediaRecorder(this.micStream);
+        this.mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            this.recordedChunks.push(e.data);
+          }
+        };
+        this.mediaRecorder.start(200);
+      } catch (err) {
+        console.warn('MediaRecorder failed completely:', err);
+      }
     }
   }
 
@@ -230,7 +323,10 @@ class AudioManager {
         const blob = new Blob(this.recordedChunks, { type: mimeType });
         this.recordedChunks = [];
 
-        // Convert blob to base64
+        if (blob.size === 0) {
+          return resolve(null);
+        }
+
         const reader = new FileReader();
         reader.onloadend = () => {
           const result = reader.result as string;
@@ -249,7 +345,7 @@ class AudioManager {
     });
   }
 
-  // --- Playback (Gemini TTS Audio) ---
+  // --- Reliable Audio Playback for Mobile & Desktop ---
 
   public async playBase64Wav(base64: string): Promise<void> {
     this.stopPlayback();
@@ -258,29 +354,35 @@ class AudioManager {
     return new Promise((resolve, reject) => {
       try {
         const audioSrc = `data:audio/wav;base64,${base64}`;
-        const audio = new Audio(audioSrc);
-        this.currentAudioElement = audio;
+
+        // Use primed element if available, or create new
+        const audio = this.unlockedAudioElement || new Audio();
+        this.unlockedAudioElement = audio;
+        audio.src = audioSrc;
 
         audio.onended = () => {
           this.isPlaying = false;
-          this.currentAudioElement = null;
           if (this.onPlaybackEnd) this.onPlaybackEnd();
           resolve();
         };
 
         audio.onerror = (e) => {
+          console.warn('Audio playback element error:', e);
           this.isPlaying = false;
-          this.currentAudioElement = null;
           if (this.onPlaybackEnd) this.onPlaybackEnd();
           reject(e);
         };
 
-        audio.play().catch((err) => {
-          this.isPlaying = false;
-          this.currentAudioElement = null;
-          if (this.onPlaybackEnd) this.onPlaybackEnd();
-          reject(err);
-        });
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn('Audio play() rejected by browser policy:', err);
+            // Fallback to Web Speech if media element blocked
+            this.isPlaying = false;
+            if (this.onPlaybackEnd) this.onPlaybackEnd();
+            reject(err);
+          });
+        }
       } catch (err) {
         this.isPlaying = false;
         if (this.onPlaybackEnd) this.onPlaybackEnd();
@@ -290,18 +392,11 @@ class AudioManager {
   }
 
   public stopPlayback() {
-    if (this.currentAudioElement) {
+    if (this.unlockedAudioElement) {
       try {
-        this.currentAudioElement.pause();
-        this.currentAudioElement.currentTime = 0;
+        this.unlockedAudioElement.pause();
+        this.unlockedAudioElement.currentTime = 0;
       } catch (_) {}
-      this.currentAudioElement = null;
-    }
-    if (this.currentSourceNode) {
-      try {
-        this.currentSourceNode.stop();
-      } catch (_) {}
-      this.currentSourceNode = null;
     }
     if (window.speechSynthesis && window.speechSynthesis.speaking) {
       window.speechSynthesis.cancel();
@@ -322,6 +417,7 @@ class AudioManager {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) {
         this.isPlaying = false;
+        if (this.onPlaybackEnd) this.onPlaybackEnd();
         resolve();
         return;
       }
@@ -337,8 +433,7 @@ class AudioManager {
         const found = voices.find((v) => v.name.toLowerCase().includes(voiceName.toLowerCase()));
         if (found) utterance.voice = found;
       } else {
-        // Find a natural Spanish or English voice
-        const preferred = voices.find((v) => v.lang.startsWith('es') || v.lang.startsWith('en'));
+        const preferred = voices.find((v) => v.lang.startsWith('es'));
         if (preferred) utterance.voice = preferred;
       }
 
