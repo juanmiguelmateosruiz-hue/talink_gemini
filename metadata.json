@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Live Call - Llamada de Voz Bidireccional",
+  "description": "Experiencia conversacional fluida de voz en tiempo real estilo llamada telefónica con Gemini, impulsada por backend proxy con el SDK oficial @google/genai.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
